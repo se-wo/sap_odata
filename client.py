@@ -1,0 +1,184 @@
+from __future__ import annotations
+
+import requests
+
+from .auth import AuthProvider
+from .metadata import describe, parse_metadata
+from .models import ServiceInfo, ServiceMetadata
+from .query import Query
+
+
+class SAPODataClient:
+    """Main entry point for the SAP OData client.
+
+    Usage:
+        from sap_odata.auth.oauth2 import OAuth2UserTokenExchange
+        from sap_odata.client import SAPODataClient
+
+        auth = OAuth2UserTokenExchange(".default_key")
+        client = SAPODataClient(auth, base_url=auth.base_url, catalog_path=auth.catalog_path)
+        services = client.list_services()
+    """
+
+    def __init__(self, auth: AuthProvider, base_url: str, catalog_path: str):
+        self._auth = auth
+        self._base_url = base_url.rstrip("/")
+        self._catalog_path = catalog_path
+        self._session = requests.Session()
+        self._session.headers["Accept"] = "application/json"
+        self._authenticated = False
+
+    def _ensure_auth(self) -> None:
+        if not self._authenticated:
+            self._auth.authenticate(self._session)
+            self._authenticated = True
+
+    def _get(self, url: str, **kwargs: object) -> requests.Response:
+        self._ensure_auth()
+        resp = self._session.get(url, **kwargs)
+        if resp.status_code == 401:
+            # Token may have expired — re-authenticate once
+            self._authenticated = False
+            self._ensure_auth()
+            resp = self._session.get(url, **kwargs)
+        return resp
+
+    def list_services(self) -> list[ServiceInfo]:
+        """List all OData services from the ABAP catalog."""
+        url = f"{self._base_url}{self._catalog_path}/ServiceCollection?$format=json"
+        resp = self._get(url)
+        resp.raise_for_status()
+
+        results = resp.json().get("d", {}).get("results", [])
+        services = []
+        for svc in results:
+            services.append(ServiceInfo(
+                technical_name=svc.get("TechnicalServiceName", ""),
+                version=svc.get("TechnicalServiceVersion", ""),
+                title=svc.get("Title", ""),
+                url=svc.get("ServiceUrl", ""),
+            ))
+        return services
+
+    def get_metadata(self, service_path: str) -> ServiceMetadata:
+        """Fetch and parse $metadata for a service.
+
+        Args:
+            service_path: e.g. "/sap/opu/odata/sap/API_FLIGHT_SRV"
+        """
+        url = f"{self._base_url}{service_path}/$metadata"
+        self._ensure_auth()
+        # Metadata is XML, override Accept for this request
+        resp = self._session.get(url, headers={"Accept": "application/xml"})
+        if resp.status_code == 401:
+            self._authenticated = False
+            self._ensure_auth()
+            resp = self._session.get(url, headers={"Accept": "application/xml"})
+        resp.raise_for_status()
+        return parse_metadata(resp.text)
+
+    def describe_service(self, service_path: str) -> str:
+        """Return an LLM-friendly text description of a service's data model."""
+        metadata = self.get_metadata(service_path)
+        return describe(metadata)
+
+    def query(self, service_path: str, entity_set: str) -> Query:
+        """Create a Query builder for an entity set.
+
+        The returned Query is attached to this client, so ``.execute()``,
+        ``.execute_all()``, and ``.get_count()`` work directly::
+
+            results = client.query("/sap/.../SRV", "Flights").filter(F.eq("CarrierId", "LH")).top(5).execute()
+        """
+        q = Query(entity_set)
+        q._service_path = service_path
+        q._client = self
+        return q
+
+    def read(self, service_path: str, entity_set: str, **params: str) -> list[dict]:
+        """Shorthand: GET an entity set and return results as list of dicts.
+
+        Args:
+            service_path: e.g. "/sap/opu/odata/sap/API_FLIGHT_SRV"
+            entity_set: e.g. "FlightCollection"
+            **params: OData query params like top="10", filter="CarrierId eq 'LH'"
+        """
+        q = Query(entity_set)
+        for key, value in params.items():
+            if key == "top":
+                q.top(int(value))
+            elif key == "skip":
+                q.skip(int(value))
+            elif key == "filter":
+                q.filter(value)
+            elif key == "select":
+                q.select(*value.split(","))
+            elif key == "expand":
+                q.expand(*value.split(","))
+            elif key == "orderby":
+                q.orderby(*value.split(","))
+
+        return self.execute_query(service_path, q)
+
+    def execute_query(self, service_path: str, query: Query) -> list[dict]:
+        """Execute a Query and return results as list of dicts."""
+        path = query.build_path()
+        qs = query.build()
+        url = f"{self._base_url}{service_path}/{path}"
+        if qs:
+            url += f"?{qs}"
+
+        resp = self._get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Single-entity responses have "d" without "results"
+        d = data.get("d", {})
+        if "results" in d:
+            return d["results"]
+        # Single entity — return as one-element list for consistent API
+        if isinstance(d, dict) and d:
+            return [d]
+        return []
+
+    def _execute_all(
+        self, service_path: str, query: Query, *, max_pages: int = 100
+    ) -> list[dict]:
+        """Execute a query and follow ``__next`` pagination links."""
+        all_results: list[dict] = []
+
+        # First page
+        path = query.build_path()
+        qs = query.build()
+        url = f"{self._base_url}{service_path}/{path}"
+        if qs:
+            url += f"?{qs}"
+
+        for _ in range(max_pages):
+            resp = self._get(url)
+            resp.raise_for_status()
+            data = resp.json()
+
+            d = data.get("d", {})
+            results = d.get("results", [])
+            all_results.extend(results)
+
+            # Check for next page link
+            next_url = d.get("__next")
+            if not next_url:
+                break
+            url = next_url
+
+        return all_results
+
+    def _execute_count(self, service_path: str, query: Query) -> int:
+        """Execute a ``/$count`` request and return the integer count."""
+        path = query.build_path()
+        qs = query.build()
+        url = f"{self._base_url}{service_path}/{path}"
+        if qs:
+            url += f"?{qs}"
+
+        resp = self._get(url, headers={"Accept": "text/plain"})
+        resp.raise_for_status()
+        return int(resp.text.strip())
