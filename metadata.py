@@ -3,13 +3,18 @@ from __future__ import annotations
 from xml.etree import ElementTree as ET
 
 from .models import (
+    Action,
+    ActionImport,
     Annotation,
     Association,
     AssociationEnd,
     EntitySet,
     EntityType,
+    Function,
     FunctionImport,
+    FunctionImportV4,
     NavigationProperty,
+    Parameter,
     Property,
     ServiceMetadata,
     ValueListInfo,
@@ -42,9 +47,10 @@ def parse_metadata(xml_text: str) -> ServiceMetadata:
     root = ET.fromstring(xml_text)
     metadata = ServiceMetadata()
 
-    # Find Schema element — try multiple EDM namespace versions
+    # Find Schema element — try multiple EDM namespace versions (V4 first)
     schema = None
     for ns_uri in [
+        NS_EDM_V4,
         "http://schemas.microsoft.com/ado/2008/09/edm",
         "http://schemas.microsoft.com/ado/2006/04/edm",
         "http://schemas.microsoft.com/ado/2009/11/edm",
@@ -69,6 +75,14 @@ def parse_metadata(xml_text: str) -> ServiceMetadata:
         association = _parse_association(assoc_elem)
         metadata.associations.append(association)
 
+    # Parse V4 Actions from Schema
+    for action_elem in schema.findall(f"{{{NS['edm']}}}Action"):
+        metadata.actions.append(_parse_action(action_elem))
+
+    # Parse V4 Functions from Schema
+    for func_elem in schema.findall(f"{{{NS['edm']}}}Function"):
+        metadata.functions.append(_parse_function(func_elem))
+
     # Parse EntityContainer
     container = schema.find(f"{{{NS['edm']}}}EntityContainer")
     if container is not None:
@@ -76,9 +90,20 @@ def parse_metadata(xml_text: str) -> ServiceMetadata:
             entity_set = _parse_entity_set(es_elem)
             metadata.entity_sets.append(entity_set)
 
+        # V2 FunctionImport (has m:HttpMethod)
         for fi_elem in container.findall(f"{{{NS['edm']}}}FunctionImport"):
-            func_import = _parse_function_import(fi_elem)
-            metadata.function_imports.append(func_import)
+            # V4-style FunctionImport has a "Function" attribute; V2 does not
+            if fi_elem.get("Function"):
+                metadata.function_imports_v4.append(_parse_function_import_v4(fi_elem))
+            elif fi_elem.get("Action"):
+                metadata.action_imports.append(_parse_action_import(fi_elem))
+            else:
+                func_import = _parse_function_import(fi_elem)
+                metadata.function_imports.append(func_import)
+
+        # V4 ActionImport elements
+        for ai_elem in container.findall(f"{{{NS['edm']}}}ActionImport"):
+            metadata.action_imports.append(_parse_action_import(ai_elem))
 
     # Parse vocabulary annotation blocks (V4-style <Annotations>)
     _parse_annotations(root, metadata)
@@ -171,6 +196,61 @@ def _parse_function_import(elem: ET.Element) -> FunctionImport:
     return fi
 
 
+def _parse_action(elem: ET.Element) -> Action:
+    """Parse a V4 <Action> element from Schema."""
+    action = Action(
+        name=elem.get("Name", ""),
+        is_bound=_bool(elem.get("IsBound", "false"), False),
+    )
+    for param_elem in elem.findall(f"{{{NS['edm']}}}Parameter"):
+        action.parameters.append(Parameter(
+            name=param_elem.get("Name", ""),
+            type=param_elem.get("Type", ""),
+            nullable=_bool(param_elem.get("Nullable", "true")),
+        ))
+    ret = elem.find(f"{{{NS['edm']}}}ReturnType")
+    if ret is not None:
+        action.return_type = ret.get("Type", "")
+    return action
+
+
+def _parse_function(elem: ET.Element) -> Function:
+    """Parse a V4 <Function> element from Schema."""
+    func = Function(
+        name=elem.get("Name", ""),
+        is_bound=_bool(elem.get("IsBound", "false"), False),
+        is_composable=_bool(elem.get("IsComposable", "false"), False),
+    )
+    for param_elem in elem.findall(f"{{{NS['edm']}}}Parameter"):
+        func.parameters.append(Parameter(
+            name=param_elem.get("Name", ""),
+            type=param_elem.get("Type", ""),
+            nullable=_bool(param_elem.get("Nullable", "true")),
+        ))
+    ret = elem.find(f"{{{NS['edm']}}}ReturnType")
+    if ret is not None:
+        func.return_type = ret.get("Type", "")
+    return func
+
+
+def _parse_action_import(elem: ET.Element) -> ActionImport:
+    """Parse a V4 <ActionImport> element from EntityContainer."""
+    return ActionImport(
+        name=elem.get("Name", ""),
+        action=elem.get("Action", ""),
+        entity_set_path=elem.get("EntitySet", ""),
+    )
+
+
+def _parse_function_import_v4(elem: ET.Element) -> FunctionImportV4:
+    """Parse a V4 <FunctionImport> element from EntityContainer."""
+    return FunctionImportV4(
+        name=elem.get("Name", ""),
+        function=elem.get("Function", ""),
+        entity_set_path=elem.get("EntitySet", ""),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Vocabulary annotation parsing (V4-style <Annotations Target="...">)
 # ---------------------------------------------------------------------------
@@ -235,7 +315,7 @@ def _extract_annotation_value(elem: ET.Element, ns: str) -> object:
     <Collection>, <PropertyValue> structures.
     """
     # Check for inline value attributes
-    for attr in ("String", "Bool", "EnumMember", "Int", "Path", "EnumValue"):
+    for attr in ("String", "Bool", "EnumMember", "Int", "Path", "PropertyPath", "EnumValue"):
         val = elem.get(attr)
         if val is not None:
             if attr == "Bool":
@@ -245,7 +325,7 @@ def _extract_annotation_value(elem: ET.Element, ns: str) -> object:
     # Check for child value elements
     for child_ns in (ns, NS_EDM_V4, NS["edm"]):
         # <String>, <Bool>, etc.
-        for simple in ("String", "Bool", "Int", "Path", "EnumMember"):
+        for simple in ("String", "Bool", "Int", "Path", "PropertyPath", "EnumMember"):
             child = elem.find(f"{{{child_ns}}}{simple}")
             if child is not None and child.text:
                 if simple == "Bool":
@@ -278,7 +358,7 @@ def _parse_record(elem: ET.Element, ns: str) -> dict:
             if not prop_name:
                 continue
             # Check inline value
-            prop_val = pv.get("String") or pv.get("Bool") or pv.get("Path") or pv.get("EnumMember")
+            prop_val = pv.get("String") or pv.get("Bool") or pv.get("Path") or pv.get("PropertyPath") or pv.get("EnumMember")
             if prop_val is not None:
                 if pv.get("Bool") is not None:
                     result[prop_name] = prop_val.lower() == "true"
@@ -462,9 +542,46 @@ def describe(metadata: ServiceMetadata) -> str:
                     f"  [{assoc.name}]"
                 )
 
-    # Function Imports
+    # V4 Actions
+    if metadata.actions:
+        lines.append("\n=== Actions ===")
+        for action in metadata.actions:
+            bound = " [bound]" if action.is_bound else ""
+            params = ", ".join(
+                f"{p.name}: {p.type}" for p in action.parameters
+            )
+            ret = f" -> {action.return_type}" if action.return_type else ""
+            lines.append(f"  POST {action.name}({params}){ret}{bound}")
+
+    # V4 Functions
+    if metadata.functions:
+        lines.append("\n=== Functions ===")
+        for func in metadata.functions:
+            bound = " [bound]" if func.is_bound else ""
+            composable = " [composable]" if func.is_composable else ""
+            params = ", ".join(
+                f"{p.name}: {p.type}" for p in func.parameters
+            )
+            ret = f" -> {func.return_type}" if func.return_type else ""
+            lines.append(f"  GET {func.name}({params}){ret}{bound}{composable}")
+
+    # V4 Action Imports
+    if metadata.action_imports:
+        lines.append("\n=== Action Imports ===")
+        for ai in metadata.action_imports:
+            es = f" -> {ai.entity_set_path}" if ai.entity_set_path else ""
+            lines.append(f"  {ai.name} (action: {ai.action}){es}")
+
+    # V4 Function Imports
+    if metadata.function_imports_v4:
+        lines.append("\n=== Function Imports (V4) ===")
+        for fi in metadata.function_imports_v4:
+            es = f" -> {fi.entity_set_path}" if fi.entity_set_path else ""
+            lines.append(f"  {fi.name} (function: {fi.function}){es}")
+
+    # V2 Function Imports (legacy)
     if metadata.function_imports:
-        lines.append("\n=== Function Imports (actions) ===")
+        lines.append("\n=== Function Imports (V2) ===")
         for fi in metadata.function_imports:
             params = ", ".join(
                 f"{p.name}: {p.type.replace('Edm.', '')}" for p in fi.parameters

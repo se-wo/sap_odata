@@ -96,12 +96,54 @@ class Annotation:
 
 
 @dataclass
+class Parameter:
+    name: str
+    type: str
+    nullable: bool = True
+
+
+@dataclass
+class Action:
+    name: str
+    is_bound: bool = False
+    parameters: list[Parameter] = field(default_factory=list)
+    return_type: str = ""
+
+
+@dataclass
+class Function:
+    name: str
+    is_bound: bool = False
+    is_composable: bool = False
+    parameters: list[Parameter] = field(default_factory=list)
+    return_type: str = ""
+
+
+@dataclass
+class ActionImport:
+    name: str
+    action: str = ""
+    entity_set_path: str = ""
+
+
+@dataclass
+class FunctionImportV4:
+    name: str
+    function: str = ""
+    entity_set_path: str = ""
+
+
+@dataclass
 class ServiceMetadata:
     schema_namespace: str = ""
     entity_types: list[EntityType] = field(default_factory=list)
     associations: list[Association] = field(default_factory=list)
     entity_sets: list[EntitySet] = field(default_factory=list)
     function_imports: list[FunctionImport] = field(default_factory=list)
+    actions: list[Action] = field(default_factory=list)
+    functions: list[Function] = field(default_factory=list)
+    action_imports: list[ActionImport] = field(default_factory=list)
+    function_imports_v4: list[FunctionImportV4] = field(default_factory=list)
     annotations: dict[str, list[Annotation]] = field(default_factory=dict)
     value_lists: dict[str, ValueListInfo] = field(default_factory=dict)
 

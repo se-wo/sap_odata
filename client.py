@@ -27,6 +27,7 @@ class SAPODataClient:
         self._session = requests.Session()
         self._session.headers["Accept"] = "application/json"
         self._authenticated = False
+        self._csrf_token: str | None = None
 
     def _ensure_auth(self) -> None:
         if not self._authenticated:
@@ -41,6 +42,41 @@ class SAPODataClient:
             self._authenticated = False
             self._ensure_auth()
             resp = self._session.get(url, **kwargs)
+        return resp
+
+    def _fetch_csrf_token(self) -> str:
+        """Fetch a CSRF token via HEAD request (required for POST/PUT/DELETE on SAP)."""
+        self._ensure_auth()
+        resp = self._session.head(
+            self._base_url + "/",
+            headers={"x-csrf-token": "Fetch"},
+        )
+        token = resp.headers.get("x-csrf-token", "")
+        self._csrf_token = token
+        return token
+
+    def _post(self, url: str, json: dict | None = None, **kwargs: object) -> requests.Response:
+        """POST with CSRF token handling and 401 retry."""
+        self._ensure_auth()
+        if not self._csrf_token:
+            self._fetch_csrf_token()
+
+        headers = kwargs.pop("headers", {}) if "headers" in kwargs else {}
+        headers["x-csrf-token"] = self._csrf_token
+        resp = self._session.post(url, json=json, headers=headers, **kwargs)
+
+        if resp.status_code == 401:
+            self._authenticated = False
+            self._ensure_auth()
+            self._fetch_csrf_token()
+            headers["x-csrf-token"] = self._csrf_token
+            resp = self._session.post(url, json=json, headers=headers, **kwargs)
+        elif resp.status_code == 403:
+            # CSRF token may have expired — refresh and retry
+            self._fetch_csrf_token()
+            headers["x-csrf-token"] = self._csrf_token
+            resp = self._session.post(url, json=json, headers=headers, **kwargs)
+
         return resp
 
     def list_services(self) -> list[ServiceInfo]:
@@ -132,19 +168,65 @@ class SAPODataClient:
         resp.raise_for_status()
         data = resp.json()
 
-        # Single-entity responses have "d" without "results"
+        return self._parse_response(data)
+
+    def call_action(
+        self, service_path: str, action_name: str, data: dict | None = None
+    ) -> dict | list[dict]:
+        """Invoke an unbound OData V4 action.
+
+        Args:
+            service_path: e.g. "/sap/opu/odata4/sap/API_FLIGHT_SRV/srvd_a2x/sap/flight/0001"
+            action_name: e.g. "ConfirmFlight"
+            data: Optional JSON body for the action.
+
+        Returns:
+            Parsed response — a dict (single result) or list of dicts.
+        """
+        url = f"{self._base_url}{service_path}/{action_name}"
+        resp = self._post(url, json=data or {})
+        resp.raise_for_status()
+        if resp.status_code == 204:
+            return {}
+        result = resp.json()
+        return self._parse_response(result)
+
+    def _execute_bound_action(
+        self, service_path: str, query: Query, data: dict | None = None
+    ) -> dict | list[dict]:
+        """Execute a bound action on an entity addressed by a Query."""
+        path = query.build_path()
+        url = f"{self._base_url}{service_path}/{path}"
+        resp = self._post(url, json=data or {})
+        resp.raise_for_status()
+        if resp.status_code == 204:
+            return {}
+        result = resp.json()
+        return self._parse_response(result)
+
+    @staticmethod
+    def _parse_response(data: dict) -> list[dict]:
+        """Parse an OData response, supporting both V4 and V2 envelopes."""
+        # V4: { "value": [...] }
+        if "value" in data:
+            value = data["value"]
+            if isinstance(value, list):
+                return value
+            # Single entity wrapped in value
+            return [value] if isinstance(value, dict) else []
+        # V2: { "d": { "results": [...] } }
         d = data.get("d", {})
-        if "results" in d:
-            return d["results"]
-        # Single entity — return as one-element list for consistent API
-        if isinstance(d, dict) and d:
-            return [d]
+        if isinstance(d, dict):
+            if "results" in d:
+                return d["results"]
+            if d:
+                return [d]
         return []
 
     def _execute_all(
         self, service_path: str, query: Query, *, max_pages: int = 100
     ) -> list[dict]:
-        """Execute a query and follow ``__next`` pagination links."""
+        """Execute a query and follow pagination links (V4 ``@odata.nextLink`` or V2 ``__next``)."""
         all_results: list[dict] = []
 
         # First page
@@ -159,12 +241,15 @@ class SAPODataClient:
             resp.raise_for_status()
             data = resp.json()
 
-            d = data.get("d", {})
-            results = d.get("results", [])
-            all_results.extend(results)
+            all_results.extend(self._parse_response(data))
 
-            # Check for next page link
-            next_url = d.get("__next")
+            # V4 pagination
+            next_url = data.get("@odata.nextLink")
+            # V2 fallback
+            if not next_url:
+                d = data.get("d", {})
+                if isinstance(d, dict):
+                    next_url = d.get("__next")
             if not next_url:
                 break
             url = next_url

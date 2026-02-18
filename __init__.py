@@ -1,13 +1,19 @@
 from .client import SAPODataClient
+from .explorer import explore_service
 from .query import F, FilterExpression, Query
 from .models import (
+    Action,
+    ActionImport,
     Annotation,
     Association,
     AssociationEnd,
     EntitySet,
     EntityType,
+    Function,
     FunctionImport,
+    FunctionImportV4,
     NavigationProperty,
+    Parameter,
     Property,
     ServiceInfo,
     ServiceMetadata,
@@ -17,16 +23,22 @@ from .models import (
 
 __all__ = [
     "SAPODataClient",
+    "explore_service",
     "F",
     "FilterExpression",
     "Query",
+    "Action",
+    "ActionImport",
     "Annotation",
     "Association",
     "AssociationEnd",
     "EntitySet",
     "EntityType",
+    "Function",
     "FunctionImport",
+    "FunctionImportV4",
     "NavigationProperty",
+    "Parameter",
     "Property",
     "ServiceInfo",
     "ServiceMetadata",

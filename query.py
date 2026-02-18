@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# OData V2 literal formatting
+# OData V4 literal formatting
 # ---------------------------------------------------------------------------
 
 _GUID_RE = re.compile(
@@ -18,7 +18,7 @@ _GUID_RE = re.compile(
 
 
 def _format_literal(value: Any) -> str:
-    """Format a Python value as an OData V2 literal."""
+    """Format a Python value as an OData V4 literal."""
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -26,15 +26,14 @@ def _format_literal(value: Any) -> str:
     if isinstance(value, int):
         return str(value)
     if isinstance(value, float):
-        return f"{value}m"
+        return str(value)
     if isinstance(value, str):
-        # Detect guid strings
+        # GUIDs are bare in V4
         if _GUID_RE.match(value):
-            return f"guid'{value}'"
-        # Detect datetime-like strings (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS)
-        if re.match(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?$", value):
-            dt = value if "T" in value else f"{value}T00:00:00"
-            return f"datetime'{dt}'"
+            return value
+        # Datetimes are bare ISO 8601 in V4
+        if re.match(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}Z?)?$", value):
+            return value
         # Regular string — single-quote, escape inner quotes
         escaped = value.replace("'", "''")
         return f"'{escaped}'"
@@ -42,14 +41,14 @@ def _format_literal(value: Any) -> str:
 
 
 def _format_key_literal(value: Any) -> str:
-    """Format a Python value as an OData V2 key literal (strings always quoted)."""
+    """Format a Python value as an OData V4 key literal (strings always quoted)."""
     if isinstance(value, str):
-        # For keys, datetime and guid detection still applies
+        # GUIDs are bare in V4
         if _GUID_RE.match(value):
-            return f"guid'{value}'"
-        if re.match(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?$", value):
-            dt = value if "T" in value else f"{value}T00:00:00"
-            return f"datetime'{dt}'"
+            return value
+        # Datetimes are bare ISO 8601 in V4
+        if re.match(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2}Z?)?$", value):
+            return value
         escaped = value.replace("'", "''")
         return f"'{escaped}'"
     return _format_literal(value)
@@ -89,7 +88,7 @@ class FilterExpression:
 # ---------------------------------------------------------------------------
 
 class F:
-    """Static factory for building OData V2 filter expressions."""
+    """Static factory for building OData V4 filter expressions."""
 
     @staticmethod
     def _compare(field: str, op: str, value: Any) -> FilterExpression:
@@ -132,9 +131,9 @@ class F:
 
     @staticmethod
     def contains(field: str, value: str) -> FilterExpression:
-        """OData V2 uses ``substringof('value', Field)``."""
+        """OData V4 uses ``contains(Field,'value')``."""
         escaped = value.replace("'", "''")
-        return FilterExpression(f"substringof('{escaped}',{field})")
+        return FilterExpression(f"contains({field},'{escaped}')")
 
     # Null checks
     @staticmethod
@@ -186,6 +185,7 @@ class Query:
         self._keys: dict[str, Any] | None = None
         self._nav: list[str] = []
         self._custom: list[tuple[str, str]] = []
+        self._action_name: str | None = None
         # Attached by SAPODataClient.query()
         self._service_path: str | None = None
         self._client: SAPODataClient | None = None
@@ -227,7 +227,7 @@ class Query:
     # ---- Counting ----
 
     def count(self, enabled: bool = True) -> Query:
-        """Add ``$inlinecount=allpages`` to the query."""
+        """Add ``$count=true`` to the query."""
         self._count = enabled
         return self
 
@@ -270,6 +270,19 @@ class Query:
         self._nav.extend(nav_props)
         return self
 
+    # ---- Bound action ----
+
+    def action(self, name: str) -> Query:
+        """Set a bound action name to invoke on the addressed entity.
+
+        Example::
+
+            Query("Orders").key(123).action("Confirm")
+            # path: Orders(123)/Confirm
+        """
+        self._action_name = name
+        return self
+
     # ---- Custom query parameters ----
 
     def custom(self, name: str, value: str) -> Query:
@@ -302,6 +315,9 @@ class Query:
         if self._nav:
             path += "/" + "/".join(self._nav)
 
+        if self._action_name:
+            path += "/" + self._action_name
+
         if self._count_only:
             path += "/$count"
 
@@ -326,7 +342,7 @@ class Query:
         if self._skip is not None:
             params.append(("$skip", str(self._skip)))
         if self._count:
-            params.append(("$inlinecount", "allpages"))
+            params.append(("$count", "true"))
         if self._format and not self._count_only:
             params.append(("$format", self._format))
 
@@ -350,8 +366,21 @@ class Query:
         client, service_path = self._require_client()
         return client.execute_query(service_path, self)
 
+    def execute_action(self, data: dict | None = None) -> dict | list[dict]:
+        """Execute a bound action via POST.
+
+        Requires ``.action(name)`` to have been called on this query.
+
+        Args:
+            data: Optional JSON body to send with the action.
+        """
+        client, service_path = self._require_client()
+        if not self._action_name:
+            raise RuntimeError("No action set on this query. Call .action('Name') first.")
+        return client._execute_bound_action(service_path, self, data)
+
     def execute_all(self, max_pages: int = 100) -> list[dict]:
-        """Execute with auto-pagination, following ``__next`` links.
+        """Execute with auto-pagination, following ``@odata.nextLink`` links.
 
         Args:
             max_pages: Maximum number of pages to fetch (safety limit).
